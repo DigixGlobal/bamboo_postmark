@@ -61,7 +61,6 @@ defmodule Bamboo.PostmarkAdapter do
     api_key = get_key(config)
     params = email
     |> convert_to_postmark_params()
-    |> IO.inspect()
     |> convert_to_batch_params()
     |> json_library().encode!()
 
