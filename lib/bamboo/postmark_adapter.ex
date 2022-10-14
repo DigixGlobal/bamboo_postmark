@@ -5,37 +5,75 @@ defmodule Bamboo.PostmarkAdapter do
   Use this adapter to send emails through Postmark's API. Requires that an API
   key is set in the config.
 
-  ## Example
+  ## Example config
 
       # In config/config.exs, or config.prod.exs, etc.
       config :my_app, MyApp.Mailer,
         adapter: Bamboo.PostmarkAdapter,
         api_key: "my_api_key" or {:system, "POSTMARK_API_KEY"}
-
   """
 
   @behaviour Bamboo.Adapter
 
   @default_base_uri "https://api.postmarkapp.com"
   @send_email_path "email"
+  @send_email_batch_path "email/batch"
   @send_email_template_path "email/withTemplate"
+  @send_email_template_batch_path "email/batchWithTemplates"
 
-  import Bamboo.ApiError, only: [build_api_error: 1]
+  defmodule ApiError do
+    @batch_limit 500
+
+    defexception [:message]
+
+    def batch_limit(), do: @batch_limit
+
+    def exception(%{message: message}) do
+      %ApiError{message: message}
+    end
+
+    def exception(%{params: params, response: response}) do
+      filtered_params = Bamboo.PostmarkAdapter.json_library().decode!(params)
+
+      message = """
+      There was a problem sending the email through the Postmark API.
+      Here is the response:
+      #{inspect response, limit: :infinity}
+
+      Here are the params we sent:
+
+      #{inspect filtered_params, limit: :infinity}
+
+      If you are deploying to Heroku and using ENV variables to handle your API key,
+      you will need to explicitly export the variables so they are available at compile time.
+      Add the following configuration to your elixir_buildpack.config:
+
+      config_vars_to_export=(
+        DATABASE_URL
+        POSTMARK_API_KEY
+      )
+      """
+      %ApiError{message: message}
+    end
+  end
 
   def deliver(email, config) do
     api_key = get_key(config)
-    params = email |> convert_to_postmark_params() |> json_library().encode!()
+    params = email
+    |> convert_to_postmark_params()
+    |> IO.inspect()
+    |> convert_to_batch_params()
+    |> json_library().encode!()
+
     uri = [base_uri(), "/", api_path(email)]
 
     case :hackney.post(uri, headers(api_key), params, options(config)) do
       {:ok, status, _headers, response} when status > 299 ->
-        {:error, build_api_error(%{params: params, response: response})}
-
+        raise(ApiError, %{params: params, response: response})
       {:ok, status, headers, response} ->
-        {:ok, %{status_code: status, headers: headers, body: response}}
-
+        %{status_code: status, headers: headers, body: response}
       {:error, reason} ->
-        {:error, build_api_error(%{message: inspect(reason)})}
+        raise(ApiError, %{message: inspect(reason)})
     end
   end
 
@@ -71,6 +109,20 @@ defmodule Bamboo.PostmarkAdapter do
     * Here are the config options that were passed in:
     #{inspect config}
     """
+  end
+
+  defp convert_to_batch_params(%{To: to} = params) when is_list(to) and length(to) > 1  do
+    if length(to) > @batch_limit do
+      raise(ApiError, %{message: "Batch limit"})
+    end
+
+    Enum.map(to, fn %{email: email} ->
+      %{params | To:  " <#{email}>"}
+    end)
+  end
+
+  defp convert_to_batch_params(params) do
+    %{params | To: recipients_to_string(params[:To], "To")}
   end
 
   defp convert_to_postmark_params(email) do
@@ -121,7 +173,7 @@ defmodule Bamboo.PostmarkAdapter do
     recipients = recipients(email)
     add_message_params(%{
                          "From": email_from(email),
-                         "To": recipients_to_string(recipients, "To"),
+                         "To": recipients,
                          "Cc": recipients_to_string(recipients, "Cc"),
                          "Bcc": recipients_to_string(recipients, "Bcc"),
                          "Subject": email.subject,
@@ -183,7 +235,10 @@ defmodule Bamboo.PostmarkAdapter do
      {"x-postmark-server-token", api_key}]
   end
 
+  defp api_path(%{to: to, private: %{template_id: _}})
+    when is_list(to) and length(to) > 1, do: @send_email_template_batch_path
   defp api_path(%{private: %{template_id: _}}), do: @send_email_template_path
+  defp api_path(%{to: to}) when is_list(to) and length(to) > 1, do: @send_email_batch_path
   defp api_path(_), do: @send_email_path
 
   defp base_uri do
